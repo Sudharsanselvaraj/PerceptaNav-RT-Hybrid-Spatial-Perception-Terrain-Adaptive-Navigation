@@ -266,6 +266,7 @@ The A* heuristic uses Manhattan distance on the grid. Diagonal moves are support
 
 Two independent depth proxies are computed and fused:
 
+
 **Bounding-box focal length method (Eq. 7):**
 ```
 D_bbox = (H_real · f) / H_pixel
