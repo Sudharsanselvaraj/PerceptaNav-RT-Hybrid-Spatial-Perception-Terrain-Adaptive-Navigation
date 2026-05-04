@@ -1,238 +1,186 @@
-"""
-Rover Detection & Navigation System
-Integrates: YOLOv8 detection + classification + energy-aware target selection
-Paper: Adaptive Target Selection in Energy-Limited Rover Systems
-"""
-
 import cv2
 import numpy as np
-import time
-import logging
-import json
-from datetime import datetime
+import requests
 from ultralytics import YOLO
-from energy_model import EnergyModel
-from decision_engine import DecisionEngine
-from target_tracker import TargetTracker
-from config import RoverConfig
 
-# ── Logging ────────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler("logs/rover.log"),
-        logging.StreamHandler()
+# -----------------------------
+# ESP32 IP (IMPORTANT: NO http)
+# -----------------------------
+ESP32_IP = "172.20.10.2"
+
+# -----------------------------
+# TURN FLASH LIGHT ON
+# -----------------------------
+def turn_flash_on(ip):
+
+    commands = [
+        f"http://{ip}/control?var=flash&val=255",
+        f"http://{ip}/control?var=led_intensity&val=255",
+        f"http://{ip}/control?var=led&val=255",
+        f"http://{ip}/control?var=led_gpio&val=255",
+        f"http://{ip}/control?var=torch&val=1"
     ]
-)
-log = logging.getLogger("RoverDetection")
 
-# ── Models ─────────────────────────────────────────────────────────────────────
-cfg = RoverConfig()
+    for cmd in commands:
+        try:
+            r = requests.get(cmd, timeout=2)
+            if r.status_code == 200:
+                print("Flash turned ON using:", cmd)
+                return
+        except:
+            pass
 
-detector   = YOLO(cfg.DETECTOR_MODEL)
-classifier = YOLO(cfg.CLASSIFIER_MODEL)
+    print("Flash control not supported by firmware")
 
-energy_model   = EnergyModel(cfg.BATTERY_CAPACITY_WH)
-decision_engine = DecisionEngine(energy_model)
-tracker        = TargetTracker()
+# Turn ON flash once
+turn_flash_on(ESP32_IP)
 
-# ── Stream ─────────────────────────────────────────────────────────────────────
-cap = cv2.VideoCapture(cfg.STREAM_URL, cv2.CAP_FFMPEG)
-if not cap.isOpened():
-    log.warning("Primary stream failed, retrying...")
-    cap = cv2.VideoCapture(cfg.STREAM_URL)
+# -----------------------------
+# LOAD MODELS
+# -----------------------------
+detector = YOLO("yolov8n.pt")   # object detection
+classifier = YOLO("runs/classify/train/weights/best.pt")  # rock classifier
 
+# -----------------------------
+# STREAM URL
+# -----------------------------
+stream_url = f"http://{ESP32_IP}:81/stream"
+
+# Use default backend (more stable on Mac)
+cap = cv2.VideoCapture(stream_url)
+
+# Reduce buffer delay
 cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
-def draw_3d_mesh(frame, color=(0, 255, 0)):
+WINDOW_WIDTH = 960
+WINDOW_HEIGHT = 720
+
+# -----------------------------
+# 3D MESH FUNCTION
+# -----------------------------
+def draw_3d_mesh(frame):
+
     h, w = frame.shape[:2]
     horizon = int(h * 0.6)
+
+    color = (0, 255, 0)
+
+    # horizontal lines
     for i in range(1, 15):
         y = int(horizon + (i ** 1.5) * 10)
         if y >= h:
             break
-        cv2.line(frame, (0, y), (w, y), color, max(1, int(i / 4)))
+        thickness = max(1, int(i / 4))
+        cv2.line(frame, (0, y), (w, y), color, thickness)
+
+    # vertical perspective lines
     center = w // 2
     for i in range(-8, 9):
-        cv2.line(frame,
-                 (center + i * 25, horizon),
-                 (center + i * 70, h),
-                 color, 1)
-    return frame
-
-
-def draw_hud(frame, label, confidence, energy_pct, selected_target, fps):
-    h, w = frame.shape[:2]
-
-    # ── Top bar ──
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (0, 0), (w, 60), (10, 10, 10), -1)
-    cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
-
-    # ── Classification label ──
-    color = (0, 0, 255) if label == "rock" else (0, 255, 80)
-    cv2.putText(frame, f"TERRAIN: {label.upper()}  {confidence:.2f}",
-                (15, 38), cv2.FONT_HERSHEY_DUPLEX, 0.9, color, 2)
-
-    # ── FPS ──
-    cv2.putText(frame, f"FPS: {fps:.1f}", (w - 130, 38),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 1)
-
-    # ── Energy bar ──
-    bar_x, bar_y, bar_w, bar_h = 15, h - 50, 200, 18
-    cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (50, 50, 50), -1)
-    fill = int(bar_w * energy_pct / 100)
-    bar_color = (0, 255, 80) if energy_pct > 40 else (0, 165, 255) if energy_pct > 20 else (0, 0, 255)
-    cv2.rectangle(frame, (bar_x, bar_y), (bar_x + fill, bar_y + bar_h), bar_color, -1)
-    cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (120, 120, 120), 1)
-    cv2.putText(frame, f"ENERGY {energy_pct:.1f}%", (bar_x, bar_y - 5),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
-
-    # ── Selected target ──
-    if selected_target:
-        t = selected_target
-        info = (f"TARGET: {t['label'].upper()}  "
-                f"Si={t['scientific_score']:.2f}  "
-                f"Ui={t['utility']:.3f}")
-        cv2.putText(frame, info, (15, h - 65),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 220, 255), 1)
+        x_top = center + i * 25
+        x_bottom = center + i * 70
+        cv2.line(frame, (x_top, horizon), (x_bottom, h), color, 1)
 
     return frame
 
-
-def draw_target_box(frame, label, color):
-    h, w = frame.shape[:2]
-    cx, cy = w // 2, h // 2
-    bw, bh = int(w * 0.4), int(h * 0.4)
-    x1, y1 = cx - bw // 2, cy - bh // 2
-    x2, y2 = cx + bw // 2, cy + bh // 2
-
-    # Corner brackets
-    L = 20
-    for px, py, dx, dy in [(x1, y1, 1, 1), (x2, y1, -1, 1),
-                             (x1, y2, 1, -1), (x2, y2, -1, -1)]:
-        cv2.line(frame, (px, py), (px + dx * L, py), color, 3)
-        cv2.line(frame, (px, py), (px, py + dy * L), color, 3)
-
-    cv2.putText(frame, f"[TARGET: {label.upper()}]",
-                (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-    return frame
-
-
-# ── Main loop ──────────────────────────────────────────────────────────────────
+# -----------------------------
+# WINDOW SETUP
+# -----------------------------
 cv2.namedWindow("Rover Navigation", cv2.WINDOW_NORMAL)
-cv2.resizeWindow("Rover Navigation", cfg.WINDOW_WIDTH, cfg.WINDOW_HEIGHT)
 
-frame_count = 0
-fps = 0.0
-t0 = time.time()
-mission_log = []
+# -----------------------------
+# MAIN LOOP
+# -----------------------------
+while True:
 
-log.info("Rover navigation started.")
+    ret, frame = cap.read()
 
-try:
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            log.warning("Stream lost. Reconnecting...")
-            cap.release()
-            time.sleep(1)
-            cap = cv2.VideoCapture(cfg.STREAM_URL, cv2.CAP_FFMPEG)
-            continue
+    # Reconnect if stream fails
+    if not ret:
+        print("Reconnecting...")
+        cap.release()
+        cap = cv2.VideoCapture(stream_url)
+        continue
 
-        frame = cv2.resize(frame, (cfg.WINDOW_WIDTH, cfg.WINDOW_HEIGHT))
-        frame_count += 1
+    # Resize frame
+    frame = cv2.resize(frame, (WINDOW_WIDTH, WINDOW_HEIGHT))
 
-        # ── FPS ──
-        if frame_count % 10 == 0:
-            fps = 10 / (time.time() - t0)
-            t0 = time.time()
+    # -------------------------
+    # YOLO OBJECT DETECTION
+    # -------------------------
+    det_results = detector(frame)
 
-        # ── Detection ──
-        det_results = detector(frame, verbose=False)
-        annotated = det_results[0].plot()
+    # Draw boxes manually
+    annotated = frame.copy()
 
-        # ── Classification ──
-        cls_results = classifier(frame, verbose=False)
-        label      = cls_results[0].names[cls_results[0].probs.top1]
-        confidence = float(cls_results[0].probs.top1conf)
+    for box in det_results[0].boxes:
 
-        # ── Energy update (simulate INA219 reading) ──
-        energy_model.update(power_watts=cfg.IDLE_POWER_W)
-        energy_pct = energy_model.remaining_pct()
+        x1, y1, x2, y2 = map(int, box.xyxy[0])
+        conf = float(box.conf[0])
+        cls = int(box.cls[0])
+        label = detector.names[cls]
 
-        # ── Candidate targets from detections ──
-        boxes = det_results[0].boxes
-        candidates = []
-        if boxes is not None and len(boxes):
-            for box in boxes:
-                cls_id = int(box.cls[0])
-                obj_label = det_results[0].names[cls_id]
-                conf = float(box.conf[0])
-                x1, y1, x2, y2 = box.xyxy[0].tolist()
-                cx = (x1 + x2) / 2
-                cy = (y1 + y2) / 2
-                # Estimate distance from bounding box size (proxy)
-                box_area = (x2 - x1) * (y2 - y1)
-                frame_area = cfg.WINDOW_WIDTH * cfg.WINDOW_HEIGHT
-                dist_est = cfg.MAX_RANGE_M * (1 - box_area / frame_area) + 0.5
-                candidates.append({
-                    "label":      obj_label,
-                    "confidence": conf,
-                    "distance":   dist_est,
-                    "cx": cx, "cy": cy,
-                    "box": (x1, y1, x2, y2)
-                })
+        text = f"{label} {conf:.2f}"
 
-        # ── Decision engine ──
-        selected = decision_engine.select(candidates)
+        cv2.rectangle(annotated, (x1, y1), (x2, y2), (255, 0, 0), 2)
+        cv2.putText(annotated, text, (x1, y1 - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
 
-        # ── Track & log ──
-        if selected:
-            tracker.update(selected)
-            mission_log.append({
-                "ts":     datetime.now().isoformat(),
-                "target": selected["label"],
-                "utility": selected["utility"],
-                "energy_pct": energy_pct
-            })
+    # -------------------------
+    # ROCK CLASSIFICATION
+    # -------------------------
+    cls_results = classifier(frame)
 
-        # ── Draw ──
-        if label == "rock":
-            annotated = draw_target_box(annotated, label, (0, 0, 255))
-        else:
-            annotated = draw_3d_mesh(annotated)
+    label = cls_results[0].names[cls_results[0].probs.top1]
+    confidence = cls_results[0].probs.top1conf
 
-        # Highlight selected candidate
-        if selected and "box" in selected:
-            x1, y1, x2, y2 = [int(v) for v in selected["box"]]
-            cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 220, 255), 2)
-            cv2.putText(annotated, f"OPTIMAL Ui={selected['utility']:.3f}",
-                        (x1, y1 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 220, 255), 1)
+    text = f"{label} {confidence:.2f}"
 
-        annotated = draw_hud(annotated, label, confidence,
-                             energy_pct, selected, fps)
+    h, w = annotated.shape[:2]
 
-        cv2.imshow("Rover Navigation", annotated)
+    # -------------------------
+    # VISUAL LOGIC
+    # -------------------------
+    if label == "rock":
 
-        key = cv2.waitKey(1)
-        if key == 27:  # ESC
-            break
-        elif key == ord('s'):
-            fname = f"logs/snapshot_{frame_count}.jpg"
-            cv2.imwrite(fname, annotated)
-            log.info(f"Snapshot saved: {fname}")
-        elif key == ord('r'):
-            energy_model.reset()
-            log.info("Energy model reset.")
+        # red warning box
+        cv2.rectangle(
+            annotated,
+            (int(w * 0.3), int(h * 0.3)),
+            (int(w * 0.7), int(h * 0.7)),
+            (0, 0, 255),
+            3
+        )
 
-finally:
-    cap.release()
-    cv2.destroyAllWindows()
+        color = (0, 0, 255)
 
-    # Save mission log
-    with open("logs/mission_log.json", "w") as f:
-        json.dump(mission_log, f, indent=2)
-    log.info(f"Mission ended. {len(mission_log)} events logged.")
+    else:
+        # draw mesh when safe
+        annotated = draw_3d_mesh(annotated)
+        color = (0, 255, 0)
+
+    # -------------------------
+    # TEXT DISPLAY
+    # -------------------------
+    cv2.putText(
+        annotated,
+        text,
+        (20, 40),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        1,
+        color,
+        2
+    )
+
+    # -------------------------
+    # SHOW OUTPUT
+    # -------------------------
+    cv2.imshow("Rover Navigation", annotated)
+
+    if cv2.waitKey(1) == 27:
+        break
+
+# -----------------------------
+# CLEANUP
+# -----------------------------
+cap.release()
+cv2.destroyAllWindows()
