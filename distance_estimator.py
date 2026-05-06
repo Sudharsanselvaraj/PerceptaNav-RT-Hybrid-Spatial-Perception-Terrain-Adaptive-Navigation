@@ -6,7 +6,7 @@ Monocular distance estimation using:
 3. Calibration-based focal length method
 No depth sensor required — works with single ESP32-CAM.
 """
-
+import pandas as pd 
 import cv2
 import numpy as np
 import logging
